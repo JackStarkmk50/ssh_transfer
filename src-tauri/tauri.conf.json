@@ -1,0 +1,12 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Shelf",
+  "version": "0.1.0",
+  "identifier": "com.shelf.transfer",
+  "build": { "beforeDevCommand": "npm run dev", "devUrl": "http://localhost:1420", "beforeBuildCommand": "npm run build", "frontendDist": "../dist" },
+  "app": {
+    "windows": [{ "title": "Shelf", "width": 1180, "height": 760, "minWidth": 960, "minHeight": 640, "resizable": true }],
+    "security": {}
+  },
+  "bundle": { "active": true, "targets": "all" }
+}
