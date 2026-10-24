@@ -37,6 +37,8 @@ struct DirectoryListing {
     entries: Vec<FileEntry>,
 }
 
+const DRIVES_ROOT: &str = "shelf://drives";
+
 struct HostVerifier {
     host: String,
     port: u16,
@@ -62,6 +64,22 @@ fn app_home() -> PathBuf {
     std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn display_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().into_owned();
+    raw.strip_prefix(r"\\?\").unwrap_or(&raw).to_owned()
+}
+
+fn drives_listing() -> DirectoryListing {
+    #[cfg(windows)]
+    let entries = (b'A'..=b'Z').filter_map(|letter| {
+        let root = PathBuf::from(format!("{}:\\", letter as char));
+        root.exists().then(|| FileEntry { name: format!("{}: drive", letter as char), path: root.to_string_lossy().into_owned(), kind: "folder".into(), size: 0, modified: None })
+    }).collect();
+    #[cfg(not(windows))]
+    let entries = vec![FileEntry { name: "Root filesystem".into(), path: "/".into(), kind: "folder".into(), size: 0, modified: None }];
+    DirectoryListing { path: DRIVES_ROOT.into(), entries }
+}
+
 fn local_listing(path: PathBuf) -> Result<DirectoryListing, String> {
     let canonical = path.canonicalize().map_err(|e| format!("Cannot open folder: {e}"))?;
     let mut entries = std::fs::read_dir(&canonical)
@@ -71,10 +89,10 @@ fn local_listing(path: PathBuf) -> Result<DirectoryListing, String> {
             let metadata = entry.metadata().ok()?;
             let kind = if metadata.is_dir() { "folder" } else { "file" }.to_owned();
             let modified = metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|t| t.as_secs());
-            Some(FileEntry { name: entry.file_name().to_string_lossy().into_owned(), path: entry.path().to_string_lossy().into_owned(), kind, size: metadata.len(), modified })
+            Some(FileEntry { name: entry.file_name().to_string_lossy().into_owned(), path: display_path(&entry.path()), kind, size: metadata.len(), modified })
         }).collect::<Vec<_>>();
     entries.sort_by(|a, b| (a.kind != "folder", a.name.to_lowercase()).cmp(&(b.kind != "folder", b.name.to_lowercase())));
-    Ok(DirectoryListing { path: canonical.to_string_lossy().into_owned(), entries })
+    Ok(DirectoryListing { path: display_path(&canonical), entries })
 }
 
 async fn remote_listing(sftp: &SftpSession, path: &str) -> Result<DirectoryListing, String> {
@@ -90,7 +108,10 @@ async fn remote_listing(sftp: &SftpSession, path: &str) -> Result<DirectoryListi
 
 #[tauri::command]
 async fn list_local(path: Option<String>) -> Result<DirectoryListing, String> {
-    local_listing(path.map(PathBuf::from).unwrap_or_else(app_home))
+    match path.as_deref() {
+        Some(DRIVES_ROOT) => Ok(drives_listing()),
+        _ => local_listing(path.map(PathBuf::from).unwrap_or_else(app_home)),
+    }
 }
 
 #[tauri::command]
