@@ -25,3 +25,14 @@ For the web-only interface preview:
 ```powershell
 npm run dev
 ```
+
+## Publishing a GitHub release
+
+The GitHub Actions workflow builds and publishes the Windows x64 installers whenever a tag beginning with `v` is pushed. Before tagging, update the version consistently in `package.json`, `src-tauri/Cargo.toml`, and `src-tauri/tauri.conf.json`.
+
+```powershell
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions creates the release and uploads the MSI and NSIS setup executable.
