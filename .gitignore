@@ -22,3 +22,6 @@ Thumbs.db
 
 # Tauri generated logs
 *.log
+
+# Local HyperFrames projects and exports
+video-compositions/
