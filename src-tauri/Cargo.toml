@@ -1,6 +1,6 @@
 [package]
 name = "shelf"
-version = "1.0.0"
+version = "1.0.1"
 description = "A small, secure SFTP transfer client"
 authors = ["Shelf contributors"]
 edition = "2021"

@@ -163,13 +163,27 @@ async fn download_file(remote_path: String, local_directory: String, state: Stat
     local.flush().await.map_err(|e| format!("Download did not finish cleanly: {e}"))
 }
 
+#[tauri::command]
+async fn delete_local_file(path: String) -> Result<(), String> {
+    let metadata = tokio::fs::metadata(&path).await.map_err(|e| format!("Cannot inspect local file: {e}"))?;
+    if !metadata.is_file() { return Err("Only files can be deleted here.".into()); }
+    tokio::fs::remove_file(path).await.map_err(|e| format!("Could not delete local file: {e}"))
+}
+
+#[tauri::command]
+async fn delete_remote_file(path: String, state: State<'_, ShelfState>) -> Result<(), String> {
+    let guard = state.sftp.lock().await;
+    let sftp = guard.as_ref().ok_or("Connect to a server first.")?;
+    sftp.remove_file(path).await.map_err(|e| format!("Could not delete remote file: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .manage(ShelfState { sftp: Mutex::new(None) })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_local, connect_sftp, list_remote, upload_file, download_file])
+        .invoke_handler(tauri::generate_handler![list_local, connect_sftp, list_remote, upload_file, download_file, delete_local_file, delete_remote_file])
         .run(tauri::generate_context!())
         .expect("error while running Shelf");
 }
