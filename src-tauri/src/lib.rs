@@ -1,13 +1,16 @@
-use russh::{client, keys};
+use russh::{client, keys, ChannelMsg};
 use russh::keys::PublicKeyOrCertificate;
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
-use std::{path::{Path, PathBuf}, sync::Arc};
-use tauri::State;
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+use tauri::{ipc::Channel, State};
 use tokio::{io::{AsyncWriteExt}, sync::Mutex};
 
 struct ShelfState {
     sftp: Mutex<Option<SftpSession>>,
+    ssh: Mutex<Option<client::Handle<HostVerifier>>>,
+    terminals: Mutex<HashMap<u64, russh::ChannelWriteHalf<client::Msg>>>,
+    next_terminal_id: AtomicU64,
 }
 
 #[derive(Deserialize)]
@@ -128,7 +131,55 @@ async fn connect_sftp(input: ConnectionInput, state: State<'_, ShelfState>) -> R
     let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| format!("Could not start SFTP: {e}"))?;
     let listing = remote_listing(&sftp, ".").await?;
     *state.sftp.lock().await = Some(sftp);
+    *state.ssh.lock().await = Some(session);
     Ok(listing)
+}
+
+#[tauri::command]
+async fn open_terminal(columns: u32, rows: u32, output: Channel<String>, state: State<'_, ShelfState>) -> Result<u64, String> {
+    let channel = {
+        let guard = state.ssh.lock().await;
+        let ssh = guard.as_ref().ok_or("Connect to a server first.")?;
+        ssh.channel_open_session().await.map_err(|e| format!("Could not open terminal channel: {e}"))?
+    };
+    let columns = columns.clamp(1, 500);
+    let rows = rows.clamp(1, 200);
+    channel.request_pty(false, "xterm-256color", columns, rows, 0, 0, &[]).await.map_err(|e| format!("Could not request terminal: {e}"))?;
+    channel.request_shell(false).await.map_err(|e| format!("Could not start remote shell: {e}"))?;
+    let (mut reader, writer) = channel.split();
+    let terminal_id = state.next_terminal_id.fetch_add(1, Ordering::Relaxed);
+    state.terminals.lock().await.insert(terminal_id, writer);
+    tauri::async_runtime::spawn(async move {
+        while let Some(message) = reader.wait().await {
+            match message {
+                ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => { let _ = output.send(String::from_utf8_lossy(&data).into_owned()); }
+                ChannelMsg::Eof | ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+    });
+    Ok(terminal_id)
+}
+
+#[tauri::command]
+async fn write_terminal(terminal_id: u64, data: String, state: State<'_, ShelfState>) -> Result<(), String> {
+    if data.len() > 65_536 { return Err("Terminal input is too large.".into()); }
+    let guard = state.terminals.lock().await;
+    let terminal = guard.get(&terminal_id).ok_or("Terminal is no longer open.")?;
+    terminal.data_bytes(data).await.map_err(|e| format!("Could not send terminal input: {e}"))
+}
+
+#[tauri::command]
+async fn resize_terminal(terminal_id: u64, columns: u32, rows: u32, state: State<'_, ShelfState>) -> Result<(), String> {
+    let guard = state.terminals.lock().await;
+    let terminal = guard.get(&terminal_id).ok_or("Terminal is no longer open.")?;
+    terminal.window_change(columns.clamp(1, 500), rows.clamp(1, 200), 0, 0).await.map_err(|e| format!("Could not resize terminal: {e}"))
+}
+
+#[tauri::command]
+async fn close_terminal(terminal_id: u64, state: State<'_, ShelfState>) -> Result<(), String> {
+    let terminal = state.terminals.lock().await.remove(&terminal_id).ok_or("Terminal is no longer open.")?;
+    terminal.close().await.map_err(|e| format!("Could not close terminal: {e}"))
 }
 
 #[tauri::command]
@@ -180,10 +231,10 @@ async fn delete_remote_file(path: String, state: State<'_, ShelfState>) -> Resul
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(ShelfState { sftp: Mutex::new(None) })
+        .manage(ShelfState { sftp: Mutex::new(None), ssh: Mutex::new(None), terminals: Mutex::new(HashMap::new()), next_terminal_id: AtomicU64::new(1) })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_local, connect_sftp, list_remote, upload_file, download_file, delete_local_file, delete_remote_file])
+        .invoke_handler(tauri::generate_handler![list_local, connect_sftp, open_terminal, write_terminal, resize_terminal, close_terminal, list_remote, upload_file, download_file, delete_local_file, delete_remote_file])
         .run(tauri::generate_context!())
         .expect("error while running Shelf");
 }
