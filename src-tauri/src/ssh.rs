@@ -122,7 +122,9 @@ pub fn app_home() -> PathBuf {
 }
 
 pub fn key_hashes(algorithm: keys::Algorithm) -> Vec<Option<keys::HashAlg>> {
-    if algorithm.is_rsa() { vec![Some(keys::HashAlg::Sha512), Some(keys::HashAlg::Sha256), None] } else { vec![None] }
+    // RSA uses SHA-2 signatures only; never request legacy ssh-rsa (SHA-1), which modern
+    // servers reject and no agent should be asked to produce.
+    if algorithm.is_rsa() { vec![Some(keys::HashAlg::Sha512), Some(keys::HashAlg::Sha256)] } else { vec![None] }
 }
 
 pub async fn authenticate_with_agent<S: keys::agent::client::AgentStream + Send + Unpin>(session: &mut client::Handle<HostVerifier>, username: &str, agent: &mut keys::agent::client::AgentClient<S>) -> bool {
@@ -195,10 +197,20 @@ pub async fn connect_authenticated(input: &ConnectionInput) -> Result<client::Ha
 
     let passphrase = if input.key_passphrase.is_empty() { None } else { Some(input.key_passphrase.as_str()) };
     let mut found_key = false;
+    let mut rsa_key_path: Option<PathBuf> = None;
     for path in candidate_key_paths(input) {
         if !path.is_file() { continue; }
         found_key = true;
         let key = match keys::load_secret_key(&path, passphrase) { Ok(key) => key, Err(_) => continue };
+        if key.algorithm().is_rsa() {
+            // Shelf is built without the advisory-flagged RustCrypto rsa crate, so it never signs
+            // with an RSA private key in-process. RSA authentication goes through the system SSH
+            // agent instead; remember the key's path so the final error can name it specifically.
+            // Note: an RSA key that fails to load (e.g. passphrase missing) falls through to the
+            // generic message below - a known limitation, since we only learn the type by parsing.
+            if rsa_key_path.is_none() { rsa_key_path = Some(path); }
+            continue;
+        }
         let mut session = open_session(input).await?;
         if authenticate_key(&mut session, input.username.trim(), key).await { return Ok(session); }
     }
@@ -207,8 +219,30 @@ pub async fn connect_authenticated(input: &ConnectionInput) -> Result<client::Ha
         let mut session = open_session(input).await?;
         if authenticate_with_system_agent(&mut session, input.username.trim()).await { return Ok(session); }
     }
-    if !input.private_key_path.trim().is_empty() { return Err("The selected private key could not authenticate with this server. Check the key file and passphrase.".into()); }
-    if found_key { Err("The SSH agent and configured key files were not accepted. Enter a password or select the correct private key.".into()) } else { Err("No password was entered and no usable SSH agent or configured key was found. Enter a password or select a private key.".into()) }
+    if !input.private_key_path.trim().is_empty() {
+        return Err(if let Some(path) = &rsa_key_path {
+            format!("The selected key is an RSA key; Shelf does not sign with RSA key files directly. {} Then connect again with the key field left empty.", rsa_agent_steps(path))
+        } else {
+            "The selected private key could not authenticate with this server. Check the key file and passphrase. If it is an encrypted or older-format RSA key, Shelf cannot read it directly - load it into your SSH agent with ssh-add (the agent asks for its passphrase itself), then connect with the key field left empty.".into()
+        });
+    }
+    if let Some(path) = &rsa_key_path {
+        return Err(format!("Your RSA key ({}) is handled by your SSH agent, not by Shelf directly. {} Then connect again. You can also enter the account password instead.", display_path(path), rsa_agent_steps(path)));
+    }
+    if found_key { Err("The SSH agent and configured key files were not accepted. Enter a password or select the correct private key. If a key is an encrypted or older-format RSA key, Shelf cannot read it directly - load it into your SSH agent with ssh-add (the agent asks for its passphrase itself), then connect again.".into()) } else { Err("No password was entered and no usable SSH agent or configured key was found. Enter a password or select a private key.".into()) }
+}
+
+// OS-specific agent setup steps naming the actual key file. The Linux form warns that a
+// terminal-started agent is invisible to an already-running GUI app, so Shelf must be
+// launched from a shell that has the agent (or the desktop session's agent must be used).
+#[cfg(windows)]
+fn rsa_agent_steps(path: &Path) -> String {
+    format!("Start the ssh-agent service if it is stopped (elevated PowerShell: Start-Service ssh-agent), then in PowerShell run: ssh-add \"{}\".", display_path(path))
+}
+
+#[cfg(not(windows))]
+fn rsa_agent_steps(path: &Path) -> String {
+    format!("In a terminal run: eval \"$(ssh-agent)\" && ssh-add \"{}\", then start Shelf from that same terminal so it can reach the agent (or add the key to your desktop session's agent if you already have one).", display_path(path))
 }
 
 pub fn display_path(path: &Path) -> String {
