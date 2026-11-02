@@ -2,7 +2,7 @@ use russh::{client, keys, ChannelMsg};
 use russh::keys::PublicKeyOrCertificate;
 use russh_sftp::client::SftpSession;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::{atomic::{AtomicU64, Ordering}, Arc}};
+use std::{collections::HashMap, path::{Path, PathBuf}, process::{Command, Stdio}, sync::{atomic::{AtomicU64, Ordering}, Arc}, time::Duration};
 use tauri::{ipc::Channel, State};
 use tokio::{io::{AsyncWriteExt}, sync::Mutex};
 
@@ -20,6 +20,10 @@ struct ConnectionInput {
     port: u16,
     username: String,
     password: String,
+    #[serde(default)]
+    private_key_path: String,
+    #[serde(default)]
+    key_passphrase: String,
     trust_new_host: bool,
 }
 
@@ -64,7 +68,100 @@ impl client::Handler for HostVerifier {
 }
 
 fn app_home() -> PathBuf {
-    std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE");
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn key_hashes(algorithm: keys::Algorithm) -> Vec<Option<keys::HashAlg>> {
+    if algorithm.is_rsa() { vec![Some(keys::HashAlg::Sha512), Some(keys::HashAlg::Sha256), None] } else { vec![None] }
+}
+
+async fn authenticate_with_agent<S: keys::agent::client::AgentStream + Send + Unpin>(session: &mut client::Handle<HostVerifier>, username: &str, agent: &mut keys::agent::client::AgentClient<S>) -> bool {
+    let identities = match agent.request_identities().await { Ok(identities) => identities, Err(_) => return false };
+    for identity in identities {
+        let public_key = identity.public_key().into_owned();
+        for hash in key_hashes(public_key.algorithm()) {
+            let result = session.authenticate_publickey_with(username, public_key.clone(), hash, agent).await;
+            if result.map(|auth| auth.success()).unwrap_or(false) { return true; }
+        }
+    }
+    false
+}
+
+#[cfg(windows)]
+async fn authenticate_with_system_agent(session: &mut client::Handle<HostVerifier>, username: &str) -> bool {
+    let mut agent = match keys::agent::client::AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await { Ok(agent) => agent, Err(_) => return false };
+    authenticate_with_agent(session, username, &mut agent).await
+}
+
+#[cfg(unix)]
+async fn authenticate_with_system_agent(session: &mut client::Handle<HostVerifier>, username: &str) -> bool {
+    let mut agent = match keys::agent::client::AgentClient::connect_env().await { Ok(agent) => agent, Err(_) => return false };
+    authenticate_with_agent(session, username, &mut agent).await
+}
+
+#[cfg(not(any(windows, unix)))]
+async fn authenticate_with_system_agent(_: &mut client::Handle<HostVerifier>, _: &str) -> bool { false }
+
+fn openssh_identity_files(host: &str, port: u16, username: &str) -> Vec<PathBuf> {
+    let target = format!("{username}@{host}");
+    let output = match Command::new("ssh").args(["-G", "-p", &port.to_string(), &target]).output() { Ok(output) if output.status.success() => output, _ => return Vec::new() };
+    String::from_utf8_lossy(&output.stdout).lines().filter_map(|line| {
+        let path = line.strip_prefix("identityfile ")?.trim();
+        if path == "none" { return None; }
+        Some(if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) { app_home().join(rest) } else { PathBuf::from(path) })
+    }).collect()
+}
+
+fn candidate_key_paths(input: &ConnectionInput) -> Vec<PathBuf> {
+    if input.private_key_path.trim().is_empty() {
+        let mut paths = openssh_identity_files(input.host.trim(), input.port, input.username.trim());
+        paths.extend(["id_ed25519", "id_ecdsa", "id_rsa"].into_iter().map(|name| app_home().join(".ssh").join(name)));
+        paths
+    } else { vec![PathBuf::from(input.private_key_path.trim())] }
+}
+
+async fn open_session(input: &ConnectionInput) -> Result<client::Handle<HostVerifier>, String> {
+    let host = input.host.trim().to_owned();
+    let config = Arc::new(client::Config::default());
+    let verifier = HostVerifier { host: host.clone(), port: input.port, trust_new_host: input.trust_new_host };
+    client::connect(config, (host.as_str(), input.port), verifier).await.map_err(|e| format!("SSH connection failed: {e}"))
+}
+
+async fn authenticate_key(session: &mut client::Handle<HostVerifier>, username: &str, key: keys::PrivateKey) -> bool {
+    for hash in key_hashes(key.algorithm()) {
+        let result = session.authenticate_publickey(username, keys::PrivateKeyWithHashAlg::new(Arc::new(key.clone()), hash)).await;
+        if result.map(|auth| auth.success()).unwrap_or(false) { return true; }
+    }
+    false
+}
+
+async fn connect_authenticated(input: &ConnectionInput) -> Result<client::Handle<HostVerifier>, String> {
+    if !input.password.trim().is_empty() && input.private_key_path.trim().is_empty() {
+        let mut session = open_session(input).await?;
+        let result = session.authenticate_password(input.username.trim(), &input.password).await.map_err(|e| format!("Authentication failed: {e}"))?;
+        return result.success().then_some(session).ok_or_else(|| "Authentication was rejected by the server.".into());
+    }
+
+    let passphrase = if input.key_passphrase.is_empty() { None } else { Some(input.key_passphrase.as_str()) };
+    let mut found_key = false;
+    for path in candidate_key_paths(input) {
+        if !path.is_file() { continue; }
+        found_key = true;
+        let key = match keys::load_secret_key(&path, passphrase) { Ok(key) => key, Err(_) => continue };
+        let mut session = open_session(input).await?;
+        if authenticate_key(&mut session, input.username.trim(), key).await { return Ok(session); }
+    }
+
+    if input.private_key_path.trim().is_empty() {
+        let mut session = open_session(input).await?;
+        if authenticate_with_system_agent(&mut session, input.username.trim()).await { return Ok(session); }
+    }
+    if !input.private_key_path.trim().is_empty() { return Err("The selected private key could not authenticate with this server. Check the key file and passphrase.".into()); }
+    if found_key { Err("The SSH agent and configured key files were not accepted. Enter a password or select the correct private key.".into()) } else { Err("No password was entered and no usable SSH agent or configured key was found. Enter a password or select a private key.".into()) }
 }
 
 fn display_path(path: &Path) -> String {
@@ -120,12 +217,7 @@ async fn list_local(path: Option<String>) -> Result<DirectoryListing, String> {
 #[tauri::command]
 async fn connect_sftp(input: ConnectionInput, state: State<'_, ShelfState>) -> Result<DirectoryListing, String> {
     if input.host.trim().is_empty() || input.username.trim().is_empty() { return Err("Host and user name are required.".into()); }
-    let host = input.host.trim().to_owned();
-    let config = Arc::new(client::Config::default());
-    let verifier = HostVerifier { host: host.clone(), port: input.port, trust_new_host: input.trust_new_host };
-    let mut session = client::connect(config, (host.as_str(), input.port), verifier).await.map_err(|e| format!("SSH connection failed: {e}"))?;
-    let authenticated = session.authenticate_password(input.username.trim(), &input.password).await.map_err(|e| format!("Authentication failed: {e}"))?;
-    if !authenticated.success() { return Err("Authentication was rejected by the server.".into()); }
+    let session = connect_authenticated(&input).await?;
     let channel = session.channel_open_session().await.map_err(|e| format!("Could not open SSH channel: {e}"))?;
     channel.request_subsystem(true, "sftp").await.map_err(|e| format!("Server does not provide SFTP: {e}"))?;
     let sftp = SftpSession::new(channel.into_stream()).await.map_err(|e| format!("Could not start SFTP: {e}"))?;
@@ -133,6 +225,24 @@ async fn connect_sftp(input: ConnectionInput, state: State<'_, ShelfState>) -> R
     *state.sftp.lock().await = Some(sftp);
     *state.ssh.lock().await = Some(session);
     Ok(listing)
+}
+
+#[tauri::command]
+async fn authenticate_system_ssh(input: ConnectionInput) -> Result<(), String> {
+    if input.host.trim().is_empty() || input.username.trim().is_empty() { return Err("Host and user name are required.".into()); }
+    let destination = format!("{}@{}", input.username.trim(), input.host.trim());
+    let mut child = tokio::process::Command::new("ssh")
+        .args(["-N", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-p", &input.port.to_string(), &destination])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| "System OpenSSH was not found. Install the OpenSSH client or select a private key.".to_string())?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    match child.try_wait().map_err(|e| format!("Could not check system SSH: {e}"))? {
+        None => { child.kill().await.map_err(|e| format!("Could not close SSH verification: {e}"))?; Ok(()) }
+        Some(_) => Err("System OpenSSH did not establish an authenticated session. Check the host key and your SSH configuration.".into()),
+    }
 }
 
 #[tauri::command]
@@ -234,7 +344,7 @@ pub fn run() {
         .manage(ShelfState { sftp: Mutex::new(None), ssh: Mutex::new(None), terminals: Mutex::new(HashMap::new()), next_terminal_id: AtomicU64::new(1) })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![list_local, connect_sftp, open_terminal, write_terminal, resize_terminal, close_terminal, list_remote, upload_file, download_file, delete_local_file, delete_remote_file])
+        .invoke_handler(tauri::generate_handler![list_local, connect_sftp, authenticate_system_ssh, open_terminal, write_terminal, resize_terminal, close_terminal, list_remote, upload_file, download_file, delete_local_file, delete_remote_file])
         .run(tauri::generate_context!())
         .expect("error while running Shelf");
 }
